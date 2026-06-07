@@ -2,6 +2,7 @@
 import argparse
 import io
 import json
+import re
 import struct
 import sys
 from pathlib import Path
@@ -65,6 +66,196 @@ def read_rcdata_resource_from_pe(pe, resource_id: int) -> tuple[bytes, int] | No
 def read_rcdata_resource(filename: Path, resource_id: int) -> tuple[bytes, int] | None:
     pe = _load_pe(filename=filename)
     return read_rcdata_resource_from_pe(pe, resource_id)
+
+
+# ---------------------------------------------------------------------------
+# In-section constant blob (MinGW / modern Nuitka backends).
+#
+# Newer Nuitka links the constants blob straight into a data section (.rdata)
+# as a linked-in symbol instead of exposing it as RT_RCDATA ID 3. The blob is
+# still the same top-level format:
+#     <name>\0 <u32 little-endian size> <size bytes>   (repeated)
+# and its first section is reliably named ".bytecode". We anchor on that, then
+# walk sections forward, bounded by the end of the containing raw section,
+# until an entry stops looking like a valid (name, size) pair.
+#
+# If a build retains no bytecode modules there is no ".bytecode" section. In
+# that case we fall back to a generic scan: probe every plausible top-level
+# section start in the read-only data sections and keep the one whose forward
+# walk chains the most bytes (the real blob dwarfs any random false match).
+# ---------------------------------------------------------------------------
+
+_BLOB_ANCHOR = b".bytecode\x00"
+_MAX_SECTION_NAME = 256
+
+# A top-level section name as it appears just before its u32 size: a dotted
+# module name (or ".bytecode"), NUL-terminated.
+_BLOB_NAME_RE = re.compile(rb"[A-Za-z_.][A-Za-z0-9_.]{0,127}\x00")
+_GENERIC_DATA_SECTIONS = (b".rdata", b".data")
+_GENERIC_MIN_COVERAGE = 4096  # ignore short accidental chains
+
+
+def _blob_name_is_valid(name_bytes: bytes) -> bool:
+    # Section names are dotted module names, ".bytecode", or "" (global).
+    if name_bytes == b"":
+        return True
+    if len(name_bytes) > _MAX_SECTION_NAME:
+        return False
+    return all(0x20 <= c < 0x7F for c in name_bytes)
+
+
+def _walk_top_level_blob(data: bytes, start: int, hard_end: int) -> int:
+    """Return the file offset just past the last valid top-level section."""
+    offset = start
+    saw_section = False
+
+    while offset < hard_end:
+        nul = data.find(b"\0", offset)
+        if nul < 0 or nul >= hard_end:
+            break
+
+        name_bytes = data[offset:nul]
+        if not _blob_name_is_valid(name_bytes):
+            break
+
+        size_off = nul + 1
+        if size_off + 4 > hard_end:
+            break
+
+        size = struct.unpack_from("<I", data, size_off)[0]
+        body_off = size_off + 4
+        if size > hard_end - body_off:
+            break
+
+        saw_section = True
+        offset = body_off + size
+
+        # Conventional empty-name terminator.
+        if name_bytes == b"" and size == 0:
+            break
+
+    return offset if saw_section else start
+
+
+def _section_raw_end(pe, file_offset: int) -> int:
+    """End of the raw section containing file_offset (or EOF)."""
+    data_len = len(pe.__data__)
+    for section in pe.sections:
+        raw_start = section.PointerToRawData
+        raw_end = raw_start + section.SizeOfRawData
+        if raw_start <= file_offset < raw_end:
+            return raw_end
+    return data_len
+
+
+def _generic_blob_start(pe) -> tuple[int, int] | None:
+    """Find the blob start when there is no ".bytecode" anchor.
+
+    Probes every plausible top-level section start inside the read-only data
+    sections and returns (start, end) for the candidate whose forward walk
+    chains the most bytes. Candidates inside an already-found blob are skipped.
+    """
+    data = pe.__data__
+    best = None  # (coverage, start, end)
+
+    for section in pe.sections:
+        if section.Name.rstrip(b"\x00") not in _GENERIC_DATA_SECTIONS:
+            continue
+
+        raw_start = section.PointerToRawData
+        raw_end = raw_start + section.SizeOfRawData
+        segment = data[raw_start:raw_end]
+
+        for match in _BLOB_NAME_RE.finditer(segment):
+            off = raw_start + match.start()
+
+            # Must sit on a section boundary (previous byte is a NUL terminator).
+            if off > raw_start and data[off - 1] != 0:
+                continue
+
+            # Skip matches that fall inside a blob we already accepted.
+            if best is not None and best[1] <= off < best[2]:
+                continue
+
+            size_off = raw_start + match.end()  # match.end() is just past the NUL
+            if size_off + 4 > raw_end:
+                continue
+
+            size = struct.unpack_from("<I", data, size_off)[0]
+            if size == 0 or size > raw_end - (size_off + 4):
+                continue
+
+            end = _walk_top_level_blob(data, off, raw_end)
+            coverage = end - off
+            if coverage < _GENERIC_MIN_COVERAGE:
+                continue
+
+            if best is None or coverage > best[0]:
+                best = (coverage, off, end)
+
+    if best is None:
+        return None
+    return best[1], best[2]
+
+
+def carve_constant_blob_from_pe(pe) -> tuple[bytes, int, int] | None:
+    """Locate the linked-in constants blob in a PE's section data.
+
+    Returns (blob_bytes, file_start, file_end) or None.
+    """
+    data = pe.__data__
+
+    start = data.find(_BLOB_ANCHOR)
+    if start >= 0:
+        end = _walk_top_level_blob(data, start, _section_raw_end(pe, start))
+        if end > start:
+            return data[start:end], start, end
+
+    # No ".bytecode" anchor (build kept no bytecode modules): scan generically.
+    generic = _generic_blob_start(pe)
+    if generic is not None:
+        start, end = generic
+        return data[start:end], start, end
+
+    return None
+
+
+def read_section_constant_blob_from_pe(pe) -> tuple[bytes, int | None] | None:
+    """RT_RCDATA-resource-compatible signature: (blob, lang_id=None)."""
+    carved = carve_constant_blob_from_pe(pe)
+    if carved is None:
+        return None
+    blob, _start, _end = carved
+    return blob, None
+
+
+def read_section_constant_blob(filename: Path) -> tuple[bytes, int | None] | None:
+    pe = _load_pe(filename=filename)
+    return read_section_constant_blob_from_pe(pe)
+
+
+def resolve_constant_blob_from_pe(pe) -> tuple[bytes, int | None, str] | None:
+    """Try RT_RCDATA ID 3 first, then fall back to in-section carving.
+
+    Returns (blob, lang_id, method) where method is "resource_id3" or
+    "rdata_section_carve".
+    """
+    resource = read_rcdata_resource_from_pe(pe, NUITKA_CONSTANT_BLOB_ID)
+    if resource is not None:
+        blob, lang_id = resource
+        return blob, lang_id, "resource_id3"
+
+    carved = read_section_constant_blob_from_pe(pe)
+    if carved is not None:
+        blob, lang_id = carved
+        return blob, lang_id, "rdata_section_carve"
+
+    return None
+
+
+def resolve_constant_blob(filename: Path) -> tuple[bytes, int | None, str] | None:
+    pe = _load_pe(filename=filename)
+    return resolve_constant_blob_from_pe(pe)
 
 
 def dump_blob(blob: bytes, output_path: Path, label: str, source: str, lang_id: int | None = None) -> None:
@@ -225,7 +416,7 @@ def extract_entries(entries: list[tuple[str, bytes, int | None]], output_dir: Pa
     return extracted
 
 
-def find_constant_blob_in_payload_entries(entries: list[tuple[str, bytes, int | None]]) -> tuple[str, bytes, int] | None:
+def find_constant_blob_in_payload_entries(entries: list[tuple[str, bytes, int | None]]) -> tuple[str, bytes, int | None] | None:
     for filename, file_data, _checksum in entries:
         if not file_data.startswith(b"MZ"):
             continue
@@ -235,23 +426,29 @@ def find_constant_blob_in_payload_entries(entries: list[tuple[str, bytes, int | 
         except pefile.PEFormatError:
             continue
 
-        resource = read_rcdata_resource_from_pe(pe, NUITKA_CONSTANT_BLOB_ID)
-        if resource is None:
+        resolved = resolve_constant_blob_from_pe(pe)
+        if resolved is None:
             continue
 
-        blob, lang_id = resource
+        blob, lang_id, _method = resolved
         return filename, blob, lang_id
 
     return None
 
 
+_METHOD_LABELS = {
+    "resource_id3": "RT_RCDATA ID 3 constant blob",
+    "rdata_section_carve": "in-section (.rdata) linked constant blob",
+}
+
+
 def dump_direct_constant_blob(input_path: Path, output_path: Path) -> bool:
-    resource = read_rcdata_resource(input_path, NUITKA_CONSTANT_BLOB_ID)
-    if resource is None:
+    resolved = resolve_constant_blob(input_path)
+    if resolved is None:
         return False
 
-    blob, lang_id = resource
-    dump_blob(blob, output_path, "RT_RCDATA ID 3 constant blob", str(input_path), lang_id)
+    blob, lang_id, method = resolved
+    dump_blob(blob, output_path, _METHOD_LABELS.get(method, method), str(input_path), lang_id)
     return True
 
 

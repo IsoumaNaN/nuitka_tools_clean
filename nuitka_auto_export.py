@@ -449,17 +449,18 @@ def make_payload_manifest(entries: list[tuple[str, bytes, int | None]]) -> list[
         is_pe = file_data.startswith(b"MZ")
         has_constant_blob = False
         lang_id = None
+        blob_method = None
 
         if is_pe:
             try:
                 pe = nuitka_dump._load_pe(data=file_data)
-                resource = nuitka_dump.read_rcdata_resource_from_pe(pe, NUITKA_CONSTANT_BLOB_ID)
+                resolved = nuitka_dump.resolve_constant_blob_from_pe(pe)
             except pefile.PEFormatError:
-                resource = None
+                resolved = None
 
-            if resource is not None:
+            if resolved is not None:
                 has_constant_blob = True
-                _blob, lang_id = resource
+                _blob, lang_id, blob_method = resolved
 
         manifest.append(
             {
@@ -468,7 +469,8 @@ def make_payload_manifest(entries: list[tuple[str, bytes, int | None]]) -> list[
                 "sha256": sha256_bytes(file_data),
                 "checksum": checksum,
                 "is_pe": is_pe,
-                "has_constant_blob_id3": has_constant_blob,
+                "has_constant_blob": has_constant_blob,
+                "constant_blob_method": blob_method,
                 "constant_blob_lang_id": lang_id,
             }
         )
@@ -488,11 +490,11 @@ def copy_input_backend(input_path: Path, output_dir: Path) -> Path:
 
 
 def export_direct_backend(input_path: Path, output_dir: Path) -> tuple[Path | None, list[dict[str, Any]]]:
-    resource = nuitka_dump.read_rcdata_resource(input_path, NUITKA_CONSTANT_BLOB_ID)
-    if resource is None:
+    resolved = nuitka_dump.resolve_constant_blob(input_path)
+    if resolved is None:
         return None, []
 
-    blob, lang_id = resource
+    blob, lang_id, method = resolved
     backend_path = copy_input_backend(input_path, output_dir)
     blob_path = output_dir / "blobs" / "constant_blob_id3.bin"
     write_bytes(blob_path, blob)
@@ -506,6 +508,7 @@ def export_direct_backend(input_path: Path, output_dir: Path) -> tuple[Path | No
             "constant_blob": str(blob_path),
             "constant_blob_size": len(blob),
             "constant_blob_sha256": sha256_bytes(blob),
+            "constant_blob_method": method,
             "lang_id": lang_id,
         }
     ]
@@ -562,11 +565,11 @@ def export_onefile(input_path: Path, output_dir: Path, checksum_mode: str) -> tu
         except pefile.PEFormatError:
             continue
 
-        resource = nuitka_dump.read_rcdata_resource_from_pe(pe, NUITKA_CONSTANT_BLOB_ID)
-        if resource is None:
+        resolved = nuitka_dump.resolve_constant_blob_from_pe(pe)
+        if resolved is None:
             continue
 
-        blob, lang_id = resource
+        blob, lang_id, method = resolved
         backend_safe = safe_name(Path(filename).name or f"backend_{index}", f"backend_{index}")
         blob_path = output_dir / "blobs" / f"{backend_safe}_constant_blob_id3.bin"
         write_bytes(blob_path, blob)
@@ -583,6 +586,7 @@ def export_onefile(input_path: Path, output_dir: Path, checksum_mode: str) -> tu
                 "constant_blob": str(blob_path),
                 "constant_blob_size": len(blob),
                 "constant_blob_sha256": sha256_bytes(blob),
+                "constant_blob_method": method,
                 "lang_id": lang_id,
             }
         )

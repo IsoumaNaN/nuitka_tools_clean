@@ -52,12 +52,12 @@ NUITKA_CONSTANT_BLOB_ID = 3
 NUITKA_ONEFILE_PAYLOAD_ID = 27
 
 SECRET_PATTERNS = [
-    (re.compile(r"(Token\s+)[A-Za-z0-9._~+/=:-]+"), r"\1<redacted>"),
-    (re.compile(r"(Bearer\s+)[A-Za-z0-9._~+/=:-]+"), r"\1<redacted>"),
-    (
-        re.compile(r"(['\"]Authorization['\"]\s*:\s*['\"](?:Token|Bearer)\s+)[^'\"]+"),
-        r"\1<redacted>",
-    ),
+    # (re.compile(r"(Token\s+)[A-Za-z0-9._~+/=:-]+"), r"\1<redacted>"),
+    # (re.compile(r"(Bearer\s+)[A-Za-z0-9._~+/=:-]+"), r"\1<redacted>"),
+    # (
+    #     re.compile(r"(['\"]Authorization['\"]\s*:\s*['\"](?:Token|Bearer)\s+)[^'\"]+"),
+    #     r"\1<redacted>",
+    # ),
 ]
 
 

@@ -815,6 +815,109 @@ def write_ai_context(
             )
 
     lines = [
+        """
+1. Do not infer functionality from strings alone.
+   - Strings, symbol names, imports, filenames, log messages, error messages, URLs, and class names are only weak hints.
+   - Never treat a string as proof that a feature or code path exists.
+   - A string may be unused, dead code, obfuscated, misleading, shared by another component, or included by a third-party library.
+
+2. Every conclusion must be supported by code-level evidence obtained from reverse-engineering tools such as:
+   - IDA Pro
+   - Hex-Rays Decompiler
+   - Ghidra
+   - Binary Ninja
+   - Hopper
+   - radare2 / Cutter
+   - WinDbg, x64dbg, GDB, LLDB
+   - Frida or other runtime instrumentation tools
+
+3. Analyze the real execution flow by examining:
+   - Function boundaries
+   - Cross-references
+   - Callers and callees
+   - Control-flow graphs
+   - Call graphs
+   - Data-flow and variable usage
+   - Function arguments and return values
+   - Global variables and structure fields
+   - Virtual function tables
+   - Interface implementations
+   - Imported and dynamically resolved APIs
+   - Indirect calls and function pointers
+   - Switch tables
+   - Exception handling paths
+   - Object construction and destruction
+   - Memory allocation and ownership
+   - File, registry, network, database, IPC, and cryptographic operations
+
+4. For every reconstructed feature, provide an evidence chain:
+
+   Entry point
+   → caller
+   → validation logic
+   → main processing function
+   → state changes
+   → external side effects
+   → return value or output
+
+5. Before naming a function, determine its behavior from:
+   - Inputs
+   - Outputs
+   - Side effects
+   - APIs it calls
+   - Fields it reads or writes
+   - Conditions controlling its execution
+   - Relationship with surrounding functions
+
+6. Do not rename a function merely because it references a suggestive string.
+   For example, a function referencing "login", "encrypt", "upload", or "success" must not automatically be named Login, Encrypt, Upload, or VerifySuccess.
+
+7. Distinguish clearly between:
+   - Confirmed behavior
+   - Strong inference
+   - Weak hypothesis
+   - Unknown behavior
+
+8. Use confidence labels:
+   - Confirmed: directly demonstrated by instructions, data flow, or runtime behavior
+   - High confidence: supported by multiple independent code-level indicators
+   - Medium confidence: plausible but missing one important part of the execution path
+   - Low confidence: based mainly on naming, strings, or incomplete evidence
+
+9. If the available evidence is insufficient, do not guess.
+   Instead, state exactly what must be inspected next, such as:
+   - Xrefs to a global variable
+   - Caller of an indirect function
+   - Runtime register values
+   - Heap object layout
+   - Vtable entries
+   - Network buffer contents
+   - Decryption result
+   - Dynamic API resolution
+   - A specific breakpoint or Frida hook
+
+10. Treat decompiler output as an approximation, not as original source code.
+    Validate suspicious decompiler output against the assembly when:
+    - Types appear incorrect
+    - Variables are reused strangely
+    - Control flow is simplified
+    - Signed and unsigned comparisons are unclear
+    - Pointer arithmetic is involved
+    - SIMD instructions are present
+    - Exception handling affects execution
+    - Indirect branches or jump tables are used
+
+11. Reconstruct data structures based on access patterns.
+    Document:
+    - Field offsets
+    - Estimated field types
+    - Read/write locations
+    - Object size
+    - Constructor behavior
+    - Relationships with other structures
+
+12. When reconstructing a high-level function, do not invent missing implementation details.
+    Produce pseudocode only for behavior supported by evidence."""
         "# Nuitka static analysis export",
         "",
         f"Input: `{input_path}`",
@@ -848,6 +951,24 @@ def write_ai_context(
         "2. Run `ida/ida_nuitka_helper.py` inside IDA.",
         "3. Use `ida/ida_nuitka_string_xrefs.json` with the constants files to map native functions to module constants.",
         "4. Use the annotated strings, constants, and decompile output for AI-assisted reconstruction.",
+        "",
+        "## AI mental model prompt for Nuitka",
+        "Use the following context as a working mental model when another AI system needs to reason about Nuitka artifacts without prior Nuitka-specific knowledge:",
+        "",
+        "- Treat Nuitka as a Python compiler, not merely a packer. It analyzes Python source, builds an internal representation, generates C/C++ code compatible with CPython semantics, and relies on the system compiler to produce an executable or extension module.",
+        "- Keep the pipeline in mind: source -> analysis -> code generation -> native build -> packaging/distribution -> runtime bootstrap -> embedded constants/resources.",
+        "- Distinguish packaging modes: accelerated mode uses an existing Python environment; standalone mode bundles the runtime and dependencies; onefile mode wraps the standalone payload inside an outer launcher; module mode produces an extension module.",
+        "- In onefile mode on Windows, the outer executable may contain a payload resource such as RT_RCDATA ID 27. Extracting that payload can reveal the real backend PE and bundled dependencies.",
+        "- The backend PE may contain a Nuitka constant blob in RT_RCDATA ID 3. That blob is a serialized runtime data structure used to materialize constants when the program starts.",
+        "- The constant blob is organized into named sections. Each section contains a count, a stream of tagged values, and an end marker. Parsing requires choosing the correct stream format, typically fixed/newer or legacy/older.",
+        "- Tagged values can represent strings, bytes, tuples, lists, dicts, sets, integers, large integers, floats, complex numbers, slices, ranges, builtins, generic aliases, union types, BlobData records, and code object metadata.",
+        "- Nuitka string data is important: strings may be stored as empty, single-byte, zero-terminated UTF-8, length-prefixed UTF-8, or attribute-name variants. Upstream Nuitka uses UTF-8 with surrogatepass semantics, so lone surrogates may be valid according to Nuitka even if strict UTF-8 output code would choke on them.",
+        "- BlobData is not automatically equivalent to Python source. It may be raw binary payload, marshal-serialized code-related data, or other runtime material. Some BlobData records can be tested with marshal.loads and written as .pyc candidates, but that is only a heuristic for reverse engineering.",
+        "- Code object metadata inside the blob can expose names, line numbers, argument counts, variable names, free vars, qualname ownership, and code kind flags. These artifacts help reconstruct program structure even when full source recovery is impossible.",
+        "- For reverse engineering, separate the layers explicitly: outer onefile launcher, extracted payload, backend PE, PE resources, constant blob, per-section constants, BlobData, code object metadata, and string cross-references in IDA/Ghidra.",
+        "- Do not confuse Nuitka with PyInstaller. Nuitka compiles program logic into native code and then packages runtime artifacts around that compiled result; PyInstaller primarily bundles the interpreter, bytecode, and dependencies.",
+        "- Treat version and platform details as version-dependent unless confirmed from source. Blob tags, formats, section parsing behavior, payload handling, and resource layouts can drift between Nuitka versions and Python versions.",
+        "- When analyzing any Nuitka-related component, answer four questions: what is it, at which stage does it appear, what is it used for, and how does it connect to compile-time generation, runtime bootstrap, packaging, and reverse engineering.",
         "",
         "## Parse errors",
         *(f"- {item['section']}: {item['error']}" for item in parse_errors),

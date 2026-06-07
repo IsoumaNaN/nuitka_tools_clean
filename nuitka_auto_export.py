@@ -515,11 +515,11 @@ def export_direct_backend(input_path: Path, output_dir: Path) -> tuple[Path | No
 
 
 def export_onefile(input_path: Path, output_dir: Path, checksum_mode: str) -> tuple[Path | None, list[dict[str, Any]], list[dict[str, Any]]]:
-    resource = nuitka_dump.read_rcdata_resource(input_path, NUITKA_ONEFILE_PAYLOAD_ID)
-    if resource is None:
+    payload_blob = nuitka_dump.locate_onefile_payload(input_path)
+    if payload_blob is None:
         return None, [], []
 
-    payload_blob, payload_lang_id = resource
+    payload_lang_id = None
     payload_dir = output_dir / "payload"
     raw_payload_path = payload_dir / "resource_id27.bin"
     write_bytes(raw_payload_path, payload_blob)

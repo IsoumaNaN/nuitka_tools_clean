@@ -198,24 +198,90 @@ def _generic_blob_start(pe) -> tuple[int, int] | None:
     return best[1], best[2]
 
 
+def _looks_like_constants_blob(blob: bytes, min_parsed: int = 4) -> bool:
+    """Confirm a carved region really is a Nuitka constants blob.
+
+    The structural walk only checks that bytes chain as <name>\\0<size><data>;
+    ordinary DLLs/PYDs can satisfy that by accident. This re-parses the region
+    with the constants reader and requires at least ``min_parsed`` top-level
+    sections that decode as genuine constants streams (count + tag values +
+    end tag). Random data essentially never decodes even once.
+    """
+    try:
+        import read_constant_blob as rcb
+    except ImportError:
+        return _structural_constants_check(blob, min_parsed)
+
+    try:
+        sections = rcb.split_top_level_blob(blob)
+    except Exception:
+        return False
+
+    if len(sections) < min_parsed:
+        return False
+
+    for blob_format in ("fixed", "legacy"):
+        good = 0
+        for name, section_data in sections:
+            try:
+                rcb.parse_section(name, section_data, blob_format=blob_format)
+            except Exception:
+                continue
+            good += 1
+            if good >= min_parsed:
+                return True
+
+    return False
+
+
+def _structural_constants_check(blob: bytes, min_parsed: int) -> bool:
+    """Fallback validation when read_constant_blob is unavailable."""
+    ident = re.compile(rb"\A[A-Za-z_.][A-Za-z0-9_.]*\Z")
+    offset = 0
+    total = 0
+    named = 0
+
+    while offset < len(blob):
+        nul = blob.find(b"\0", offset)
+        if nul < 0 or nul + 5 > len(blob):
+            break
+        name = blob[offset:nul]
+        size = struct.unpack_from("<I", blob, nul + 1)[0]
+        body = nul + 5
+        if size > len(blob) - body:
+            break
+        total += 1
+        if name in (b"", b".bytecode") or ident.match(name):
+            named += 1
+        offset = body + size
+
+    return total >= min_parsed and named >= max(min_parsed, total // 2)
+
+
 def carve_constant_blob_from_pe(pe) -> tuple[bytes, int, int] | None:
     """Locate the linked-in constants blob in a PE's section data.
 
+    Tries the ".bytecode"-anchored region first, then a generic max-coverage
+    scan, and accepts only a candidate that validates as a real constants blob.
     Returns (blob_bytes, file_start, file_end) or None.
     """
     data = pe.__data__
+    candidates = []
 
     start = data.find(_BLOB_ANCHOR)
     if start >= 0:
         end = _walk_top_level_blob(data, start, _section_raw_end(pe, start))
         if end > start:
-            return data[start:end], start, end
+            candidates.append((start, end))
 
-    # No ".bytecode" anchor (build kept no bytecode modules): scan generically.
     generic = _generic_blob_start(pe)
-    if generic is not None:
-        start, end = generic
-        return data[start:end], start, end
+    if generic is not None and generic not in candidates:
+        candidates.append(generic)
+
+    for start, end in candidates:
+        blob = data[start:end]
+        if _looks_like_constants_blob(blob):
+            return blob, start, end
 
     return None
 
@@ -239,11 +305,20 @@ def resolve_constant_blob_from_pe(pe) -> tuple[bytes, int | None, str] | None:
 
     Returns (blob, lang_id, method) where method is "resource_id3" or
     "rdata_section_carve".
+
+    A onefile wrapper (RT_RCDATA ID 27) is itself a Nuitka program with its
+    own small constants blob, but the real application lives in its payload.
+    We must NOT carve the wrapper's loader blob here, otherwise the caller
+    would stop before extracting and analysing the inner backend. Decline so
+    the onefile-extraction path runs instead.
     """
     resource = read_rcdata_resource_from_pe(pe, NUITKA_CONSTANT_BLOB_ID)
     if resource is not None:
         blob, lang_id = resource
         return blob, lang_id, "resource_id3"
+
+    if is_onefile_payload_present(pe):
+        return None
 
     carved = read_section_constant_blob_from_pe(pe)
     if carved is not None:
@@ -268,6 +343,42 @@ def dump_blob(blob: bytes, output_path: Path, label: str, source: str, lang_id: 
     print(f"Size  : {len(blob)} bytes")
     if lang_id is not None:
         print(f"Lang  : {lang_id}")
+
+
+# Compressed Nuitka onefile payloads start with "KAY" immediately followed by
+# a zstd frame magic. This composite signature lets us locate a payload that is
+# stored inside a section (not as RT_RCDATA ID 27 and not as a file overlay).
+_ONEFILE_COMPRESSED_SIG = b"KAY" + b"\x28\xb5\x2f\xfd"
+
+
+def locate_onefile_payload_from_pe(pe) -> bytes | None:
+    """Return raw onefile payload bytes (beginning with KAX/KAY), or None.
+
+    Prefers RT_RCDATA ID 27; falls back to scanning the image for the
+    compressed-payload signature. Trailing bytes after the payload are fine:
+    decompress_onefile_body() stops at the end of the zstd frame.
+    """
+    resource = read_rcdata_resource_from_pe(pe, NUITKA_ONEFILE_PAYLOAD_ID)
+    if resource is not None:
+        return resource[0]
+
+    data = pe.__data__
+    index = data.find(_ONEFILE_COMPRESSED_SIG)
+    if index >= 0:
+        return data[index:]
+
+    return None
+
+
+def locate_onefile_payload(filename: Path) -> bytes | None:
+    return locate_onefile_payload_from_pe(_load_pe(filename=filename))
+
+
+def is_onefile_payload_present(pe) -> bool:
+    """True if this PE is a onefile wrapper (resource ID 27 or KAY signature)."""
+    if read_rcdata_resource_from_pe(pe, NUITKA_ONEFILE_PAYLOAD_ID) is not None:
+        return True
+    return pe.__data__.find(_ONEFILE_COMPRESSED_SIG) >= 0
 
 
 def get_onefile_payload_region(resource_data: bytes) -> bytes:
@@ -298,23 +409,13 @@ def decompress_onefile_body(payload_region: bytes) -> bytes:
         print("Missing dependency for compressed onefile payload: pip install zstandard", file=sys.stderr)
         raise SystemExit(1)
 
-    last_error = None
-    candidates = [body]
-
-    # Windows payloads can contain up to 7 zero padding bytes before the footer.
-    for trim_count in range(1, 8):
-        if len(body) >= trim_count and body[-trim_count:] == b"\0" * trim_count:
-            candidates.append(body[:-trim_count])
-
-    for candidate in candidates:
-        try:
-            dctx = zstd.ZstdDecompressor()
-            with dctx.stream_reader(io.BytesIO(candidate)) as reader:
-                return reader.read()
-        except zstd.ZstdError as exc:
-            last_error = exc
-
-    raise ExtractionError(f"failed to decompress zstd onefile payload: {last_error}")
+    # decompressobj() reads exactly one zstd frame and stops, tolerating any
+    # trailing footer/padding bytes — and also unrelated tail bytes when the
+    # payload was located by magic scan rather than an exact resource slice.
+    try:
+        return zstd.ZstdDecompressor().decompressobj().decompress(body)
+    except zstd.ZstdError as exc:
+        raise ExtractionError(f"failed to decompress zstd onefile payload: {exc}")
 
 
 def read_utf16le_zstring(data: bytes, offset: int) -> tuple[str, int]:
@@ -453,17 +554,19 @@ def dump_direct_constant_blob(input_path: Path, output_path: Path) -> bool:
 
 
 def dump_from_onefile(input_path: Path, output_path: Path, payload_output: Path, extract_dir: Path, checksum_mode: str) -> None:
-    resource = read_rcdata_resource(input_path, NUITKA_ONEFILE_PAYLOAD_ID)
-    if resource is None:
-        raise ExtractionError("RT_RCDATA resource ID 27 not found")
+    payload_blob = locate_onefile_payload(input_path)
+    if payload_blob is None:
+        raise ExtractionError(
+            "no Nuitka onefile payload found "
+            "(no RT_RCDATA ID 27 and no KAY payload signature)"
+        )
 
-    payload_blob, payload_lang_id = resource
     dump_blob(
         payload_blob,
         payload_output,
-        "RT_RCDATA ID 27 onefile payload",
+        "Nuitka onefile payload",
         str(input_path),
-        payload_lang_id,
+        None,
     )
 
     payload_region = get_onefile_payload_region(payload_blob)
